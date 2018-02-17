@@ -1,6 +1,7 @@
 import numpy as np
 import tensorflow as tf
 import gym
+import roboschool
 import logz
 import scipy.signal
 import os
@@ -180,9 +181,9 @@ def train_PG(exp_name='',
     else:
         # YOUR_CODE_HERE
         sy_mean = build_mlp(sy_ob_no, ac_dim, 'policy')
-        sy_logstd = tf.Variable(tf.ones([None, ac_dim]), dtype=tf.float32) # logstd should just be a trainable variable, not a network output.
+        sy_logstd = tf.Variable(tf.ones([1, ac_dim]), dtype=tf.float32) # logstd should just be a trainable variable, not a network output.
         sy_std = tf.exp(sy_logstd)
-        sy_sampled_ac = sy_mean + sy_std * tf.random_normal([None, ac_dim])
+        sy_sampled_ac = sy_mean + sy_std * tf.random_normal(tf.shape(sy_mean))
         sy_logprob_n = -0.5 * tf.reduce_sum(((sy_ac_na - sy_mean) / sy_std)**2, axis=1) # Hint: Use the log probability under a multivariate gaussian.
 
     #========================================================================================#
@@ -209,7 +210,9 @@ def train_PG(exp_name='',
         # Define placeholders for targets, a loss function and an update op for fitting a
         # neural network baseline. These will be used to fit the neural network baseline.
         # YOUR_CODE_HERE
-        baseline_update_op = TODO
+        sy_b_n = tf.placeholder(shape=[None], name="value", dtype=tf.float32) # baseline target
+        baseline_loss = tf.reduce_mean((sy_b_n - baseline_prediction) ** 2)
+        baseline_update_op = tf.train.AdamOptimizer(learning_rate).minimize(baseline_loss)
 
 
     #========================================================================================#
@@ -348,8 +351,8 @@ def train_PG(exp_name='',
             # Hint #bl1: rescale the output from the nn_baseline to match the statistics
             # (mean and std) of the current or previous batch of Q-values. (Goes with Hint
             # #bl2 below.)
-
-            b_n = TODO
+            # YOUR_CODE_HERE
+            b_n = sess.run(baseline_prediction, {sy_ob_no : ob_no})
             adv_n = q_n - b_n
         else:
             adv_n = q_n.copy()
@@ -382,7 +385,8 @@ def train_PG(exp_name='',
             # targets to have mean zero and std=1. (Goes with Hint #bl1 above.)
 
             # YOUR_CODE_HERE
-            pass
+            normalized_qn = (q_n - np.mean(q_n)) / np.std(q_n)
+            sess.run(baseline_update_op, {sy_b_n : q_n, sy_ob_no : ob_no})
 
         #====================================================================================#
         #                           ----------SECTION 4----------
@@ -402,24 +406,43 @@ def train_PG(exp_name='',
                                          sy_adv_n : adv_n})
 
         # Log diagnostics
-        returns = [path["reward"].sum() for path in paths]
-        ep_lengths = [pathlength(path) for path in paths]
-        logz.log_tabular("Time", time.time() - start)
-        logz.log_tabular("Iteration", itr)
-        logz.log_tabular("AverageReturn", np.mean(returns))
-        logz.log_tabular("StdReturn", np.std(returns))
-        logz.log_tabular("MaxReturn", np.max(returns))
-        logz.log_tabular("MinReturn", np.min(returns))
-        logz.log_tabular("EpLenMean", np.mean(ep_lengths))
-        logz.log_tabular("EpLenStd", np.std(ep_lengths))
-        logz.log_tabular("Previous Loss", prev_loss)
-        logz.log_tabular("New Loss", new_loss)
-        logz.log_tabular("TimestepsThisBatch", timesteps_this_batch)
-        logz.log_tabular("TimestepsSoFar", total_timesteps)
-        logz.dump_tabular()
-        logz.pickle_tf_vars()
+        if logdir:
+            returns = [path["reward"].sum() for path in paths]
+            ep_lengths = [pathlength(path) for path in paths]
+            logz.log_tabular("Time", time.time() - start)
+            logz.log_tabular("Iteration", itr)
+            logz.log_tabular("AverageReturn", np.mean(returns))
+            logz.log_tabular("StdReturn", np.std(returns))
+            logz.log_tabular("MaxReturn", np.max(returns))
+            logz.log_tabular("MinReturn", np.min(returns))
+            logz.log_tabular("EpLenMean", np.mean(ep_lengths))
+            logz.log_tabular("EpLenStd", np.std(ep_lengths))
+            logz.log_tabular("Previous Loss", prev_loss)
+            logz.log_tabular("New Loss", new_loss)
+            logz.log_tabular("TimestepsThisBatch", timesteps_this_batch)
+            logz.log_tabular("TimestepsSoFar", total_timesteps)
+            logz.dump_tabular()
+            logz.pickle_tf_vars()
         prev_loss = new_loss
+    env.close()
+    return sess, sy_sampled_ac, sy_ob_no
 
+def visualize(
+    sess,
+    sy_sampled_ac,
+    sy_ob_no,
+    env_name='CartPole-v0'
+    ):
+    env = gym.make(env_name)
+    while True:
+        done = False
+        ob = env.reset()
+        while not done:
+            env.render()
+            time.sleep(0.05)
+            ac = sess.run(sy_sampled_ac, feed_dict={sy_ob_no : ob[np.newaxis]})
+            ac = ac[0]
+            ob, rew, done, _ = env.step(ac)
 
 def main():
     import argparse
@@ -454,29 +477,46 @@ def main():
         seed = args.seed + 10*e
         print('Running experiment with seed %d'%seed)
         def train_func():
-            train_PG(
-                exp_name=args.exp_name,
-                env_name=args.env_name,
-                n_iter=args.n_iter,
-                gamma=args.discount,
-                min_timesteps_per_batch=args.batch_size,
-                max_path_length=max_path_length,
-                learning_rate=args.learning_rate,
-                reward_to_go=args.reward_to_go,
-                animate=args.render,
-                logdir=os.path.join(logdir,'%d'%seed),
-                normalize_advantages=not(args.dont_normalize_advantages),
-                nn_baseline=args.nn_baseline,
-                seed=seed,
-                n_layers=args.n_layers,
-                size=args.size
-                )
+            sy_sampled_ac, sy_ob_no = train_PG(
+                    exp_name=args.exp_name,
+                    env_name=args.env_name,
+                    n_iter=args.n_iter,
+                    gamma=args.discount,
+                    min_timesteps_per_batch=args.batch_size,
+                    max_path_length=max_path_length,
+                    learning_rate=args.learning_rate,
+                    reward_to_go=args.reward_to_go,
+                    animate=args.render,
+                    logdir=os.path.join(logdir,'%d'%seed),
+                    normalize_advantages=not(args.dont_normalize_advantages),
+                    nn_baseline=args.nn_baseline,
+                    seed=seed,
+                    n_layers=args.n_layers,
+                    size=args.size
+                    )
         # Awkward hacky process runs, because Tensorflow does not like
         # repeatedly calling train_PG in the same thread.
         p = Process(target=train_func, args=tuple())
         p.start()
         p.join()
 
+    sess, sy_sampled_ac, sy_ob_no = train_PG(
+            exp_name=args.exp_name,
+            env_name=args.env_name,
+            n_iter=args.n_iter,
+            gamma=args.discount,
+            min_timesteps_per_batch=args.batch_size,
+            max_path_length=max_path_length,
+            learning_rate=args.learning_rate,
+            reward_to_go=args.reward_to_go,
+            animate=args.render,
+            normalize_advantages=not(args.dont_normalize_advantages),
+            nn_baseline=args.nn_baseline,
+            seed=seed,
+            n_layers=args.n_layers,
+            size=args.size
+            )
+    visualize(sess, sy_sampled_ac, sy_ob_no, args.env_name)
 
 if __name__ == "__main__":
     main()
