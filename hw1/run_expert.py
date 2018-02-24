@@ -15,6 +15,7 @@ import numpy as np
 import tf_util
 import gym
 import load_policy
+import roboschool
 
 def main():
     import argparse
@@ -28,11 +29,12 @@ def main():
     args = parser.parse_args()
 
     print('loading and building expert policy')
-    policy_fn = load_policy.load_policy(args.expert_policy_file)
+    policy = load_policy.make_policy(args.expert_policy_file)
     print('loaded and built')
 
     with tf.Session():
         tf_util.initialize()
+        policy.assign_weights()
 
         import gym
         env = gym.make(args.envname)
@@ -48,7 +50,7 @@ def main():
             totalr = 0.
             steps = 0
             while not done:
-                action = policy_fn(obs[None,:])
+                action = policy.run_policy(obs)
                 observations.append(obs)
                 actions.append(action)
                 obs, r, done, _ = env.step(action)
