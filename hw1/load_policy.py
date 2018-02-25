@@ -59,22 +59,16 @@ import pdb
 #     return policy_fn, obs_shape
 
 class Policy():
-    def __init__(self, name, input_dim, param_dict=None, layers=None, target_net=False):
+    def __init__(self, name, input_dim, output_dim, param_dict=None, layers=None,
+                 target_net=False, learning_rate=1e-2):
         self.param_dict = param_dict
         self.assign_nodes = []
         self.assign_ph = {}
         self.layers = layers
         self.target_net = target_net
 
-        obs_tuple = [
-            tf.placeholder(tf.float32, (None, 1), name="obs0"),
-            tf.placeholder(tf.float32, (None, input_dim), name="obs1"),
-        ]
-        self.obs_tuple = obs_tuple
-        actions_input = []
-        actions_input.append(obs_tuple[1])
-
-        x = tf.concat( actions_input, axis=1)
+        self.input_ph = tf.placeholder(tf.float32, (None, input_dim), name='obs')
+        x = self.input_ph
         params = {}
         with tf.variable_scope(name):
             for i, value in enumerate(self.layers):
@@ -89,34 +83,60 @@ class Policy():
             self.output = x
 
             if self.target_net:
-                # stops gradient update of target network
-                self.output = tf.stop_gradient(self.output)
                 # Initalize placeholders and assignment operators
                 for param_name in params:
                     size = params[param_name].shape
                     ph = tf.placeholder(tf.float32, size)
                     self.assign_ph[param_name] = ph
                     self.assign_nodes.append(tf.assign(params[param_name], ph))
+            else:
+                # define output placeholders
+                self.output_ph = tf.placeholder(tf.float32, [None, output_dim])
 
-    def assign_weights(self):
+                # define loss function
+                self.loss = tf.losses.mean_squared_error(self.output_ph, self.output)
+
+                # define optimizier
+                self.optimizer = tf.train.AdamOptimizer(learning_rate).minimize(self.loss)
+
+                # initialize only variables in agent policy network
+                var_list = [var for var in tf.global_variables() if name in var.name]
+                self.initializer = tf.variables_initializer(var_list)
+
+    def initialize(self):
         '''
         sess : tf Session
         '''
-        assert(self.target_net)
-        # build feed dictionary
-        feed_dict = {}
-        for param_name in self.param_dict:
-            feed_dict[self.assign_ph[param_name]] = self.param_dict[param_name]
-        tf.get_default_session().run(self.assign_nodes, feed_dict)
+        if self.target_net:
+            feed_dict = {}
+            for param_name in self.param_dict:
+                feed_dict[self.assign_ph[param_name]] = self.param_dict[param_name]
+            tf.get_default_session().run(self.assign_nodes, feed_dict)
+        else:
+            tf.get_default_session().run(self.initializer)
 
-    def run_policy(self, obs_data):
-        obs_data = [np.ones((1,)), obs_data]
-        obs_data = [obs_data[0], obs_data[1]]
-        # Because we need batch dimension, data[None] changes shape from [A] to [1,A]
-        a = tf.get_default_session().run(self.output, feed_dict=dict( (ph,data[None]) for ph,data in zip(self.obs_tuple, obs_data)))
-        return a[0]  # return first in batch
-        
-def make_policy(filename):
+    def get_action(self, obs_data):
+        a = tf.get_default_session().run(self.output,
+            feed_dict={self.input_ph : obs_data})
+        return a
+
+    def train_policy(self, obs, acs, batch_size=128, num_epochs=10):
+        size = obs.shape[0]
+        indices = np.arange(size)
+        losses = []
+        for epoch in range(num_epochs):
+            for batch in range(size // batch_size):
+                sample = np.random.choice(indices, size=batch_size, replace=False)
+                batch_obs = obs[sample]
+                batch_acs = acs[sample]
+                loss, _ = tf.get_default_session().run([self.loss, self.optimizer],
+                          feed_dict={self.input_ph : batch_obs,
+                                     self.output_ph : batch_acs})
+            print('Loss : ', loss)
+            losses.append(loss)
+        return np.mean(np.array(losses))
+
+def make_policy(filename, env):
     take_weights_here = {}
     exec(open(filename).read(), take_weights_here)
 
@@ -127,6 +147,12 @@ def make_policy(filename):
     final_w = take_weights_here["weights_final_w"]
     final_b = take_weights_here["weights_final_b"]
 
+    layers = [
+        [('dense1_w', 'dense1_b'), (dense1_w.shape, dense1_b.shape)],
+        [('dense2_w', 'dense2_b'), (dense2_w.shape, dense2_b.shape)],
+        [('final_w', 'final_b'), (final_w.shape, final_b.shape)]
+    ]
+
     param_dict = {
         'dense1_w' : dense1_w,
         'dense1_b' : dense1_b,
@@ -135,15 +161,23 @@ def make_policy(filename):
         'final_w' : final_w,
         'final_b' : final_b
     }
-    layers = [
-        [('dense1_w', 'dense1_b'), (dense1_w.shape, dense1_b.shape)],
-        [('dense2_w', 'dense2_b'), (dense2_w.shape, dense2_b.shape)],
-        [('final_w', 'final_b'), (final_w.shape, final_b.shape)],
-    ]
 
-    policy = Policy('expert_policy', dense1_w.shape[0], param_dict=param_dict, layers=layers, target_net=True)
+    policy = Policy('expert_policy',
+                    env.observation_space.shape[0],
+                    env.action_space.shape[0],
+                    param_dict=param_dict,
+                    layers=layers, target_net=True)
+    policy.initialize()
     return policy
 
-def get_new_policy(input_dim):
-    policy = Policy('agent_policy', input_dim)
+def get_new_policy(env, learning_rate=1e-2, dense_dims = [1024, 1024]):
+    input_dims = env.observation_space.shape[0]
+    output_dims = env.action_space.shape[0]
+    layers = [
+        [('dense1_w', 'dense1_b'), ([input_dims, dense_dims[0]], dense_dims[0])],
+        [('dense2_w', 'dense2_b'), ([dense_dims[0], dense_dims[1]], dense_dims[1])],
+        [('final_w', 'final_b'), ([dense_dims[1], output_dims], output_dims)]
+    ]
+    policy = Policy('agent_policy', input_dims, output_dims, layers=layers, learning_rate=learning_rate)
+    policy.initialize()
     return policy
